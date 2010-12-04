@@ -1,0 +1,285 @@
+PIRC Internals
+==============
+
+In this section, PIRC's guts are dissected in order to explain what exactly is going on under the hood. If you are interested in the nitty-gritty details, keep on reading. (Note that this is a work-in-progress and will take some time to be completed).
+
+PIRC Lexer
+----------
+
+Heredoc processor
+-----------------
+
+The Heredoc processor has only one task: flattening heredoc strings. By "flattening", I mean the following. This string:
+
+	 $S0 = <<'EOS'
+	This is
+	 a multi-line
+	  heredoc
+	   string
+	    with
+	     increasing
+	      indention
+	       on each line.
+	EOS
+
+is "flattened" into:
+
+	$S0 = "This is  a multi-line\n  heredoc\n   string\n    with\n     increasing\n      indention\n       on each line."
+
+Note that "newline" characters are inserted as well, so that the string is equivalent to the original heredoc string. Besides assigning heredoc strings to String registers, the PIR specification also allows you to use heredoc strings as arguments in subroutine invocations:
+
+	.sub main
+	  foo(<<'A')
+	This is a heredoc
+	string argument
+	A
+	.end
+	
+	.sub foo
+	  # ...
+	.end
+
+Again, the heredoc string (delimited by the string "A") will be flattened. According to the PIR specification, you can even pass multiple heredoc string arguments, like so:
+
+	.sub main
+	  foo(<<'A', 42, <<'B', 3.14, <<'C')
+	 I have a Parrot
+	A
+	 It is not a bird
+	B
+	 It is a virtual machine
+	C
+	.end
+
+Note that the heredoc arguments may be mixed with other, simple arguments such as integers and numbers. In the rest of this section, the implementation will be discussed.
+
+Heredoc parsing implementation
+------------------------------
+
+The implementation of the Heredoc preprocessor can be found in [/src/hdocprep.l](https://github.com/parrot/pirc/blob/master/src/hdocprep.l). It is a Lex/Flex lexer specification, which means you need the Flex program to generate the C code for this preprocessor. The preprocessor takes a PIR file that contains heredoc strings, and flattens out all heredoc strings. It writes a temporary file to disk that is exactly the same as the original PIR file, except that all heredoc strings are flattened.
+
+For this discussion, it is assumed you have a basic understanding of the Flex program. For instance, you need to know what "state" means in Flex context. If you don't know, please refer to [the Flex documentation page](http://flex.sourceforge.net/manual/).
+
+In order to make the heredoc preprocessor reentrant, no global variables are used. Instead, [lines 83 to 98](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L83) define a `struct global_state`. The comments in the code briefly describe what each field is for, but they will be discussed in more detail later if we walk through the actual processing of the heredocs. A new instance of this struct can be created by invoking [`init_global_state`](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L157). For now, it is useful to know that this struct has a pointer to a Parrot interpreter object, the name of the file being processed, and a pointer to the output file.
+
+The function [`process_heredocs`](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L208) is the main function of the heredoc preprocessor that the main compiler program (PIRC) invokes. This function opens the file to be processed, initializes the lexer, creates a new `global_state` struct instance, as described above, invokes the lexer to do the processing and cleans up afterwards.
+
+We will now walk through two different scenarios, in order to simplify the discussion. Scenario 1 discussed the case of single heredoc parsing, and Scenario 2 discusses multiple heredoc parsing. Multiple heredoc parsing starts out with Scenario 1, but is a bit more advanced.
+
+**Scenario 1a: single heredoc string parsing**
+
+Consider the following input:
+
+	.sub main
+	  $S0 = <<'EOS'
+	This
+	is
+	a
+	heredoc
+	string.
+	
+	EOS
+	.end
+
+The lexer starts out in the `INITIAL` state by default (as per Flex specification). When reading input such as `<<'EOS'`, the rule on [line 306](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L306) is activated. The actual string ("EOS") is stored in the field `state->delimiter`, and an escaped newline character is stored in the heredoc buffer.
+
+Since the preprocessor does not build a data structure representing the input, but instead writes the output directly (to a file), the "rest of the line" needs to be stored somewhere. This is because the `<<'EOS'` heredoc token is basically a placeholder for the actual (heredoc) string contents. Hence, the [activation of `SAVE_REST_OF_LINE` state](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L318).
+
+The state `SAVE_REST_OF_LINE` has only one function, and that is to SAVE the REST OF the LINE :-). It will match all the text after the `<<'EOS'` heredoc marker up to and include the end-of-line character. This, including an additional "\n" character is stored in the `linebuffer` field, which always contains the "rest of the line". As you can see, in this scenario there is no "rest of the line", except for the end-of-line character ("\n", or "\r\n" on Windows). See Scenario 1b below for a variant on this, in which the "rest of the line" contains a closing parenthesis of a subroutine invocation.
+
+After the heredoc marker the actual heredoc string must be scanned, hence the activation of the `HEREDOC_STRING` state on [line 331](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L331). In the state `HEREDOC_STRING`, there are three different types of input:
+
+1. "end-of-line" characters, basically an empty line (see [line 357](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L357)). An escaped newline character ("\\n") will be stored as part of the heredoc string.
+2. "normal" heredoc string lines (see [line 376](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L376). First the newline character is removed, because we may have found the heredoc string delimiter, that was stored earlier. In order to compare the strings, the newline character is chopped off (see [lines 381-384](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L381)). Then, a string comparison is done in order to see whether we just read the heredoc string delimiter. If so, then we need to continue scanning the "rest of the line" that was saved earlier. However, since we need to switch back later to the current buffer, we need to store this current buffer ([line 395](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L395)). Also, the lexer's state is changed to `SCAN_STRING`, since we're going to scan a saved string. Then, the lexer's told to read the next input from the string buffer ([line 406](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L406)). If however, we did not read the heredoc delimiter, then it's just a line that's part of the heredoc string, which needs to be stored. In that case, a new buffer is allocated to store the heredoc string so far, plus the new line that's just been scanned. The old buffer is released.
+3. End of file ([line 423](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L423)). When the lexer encounters end-of-file, an error is printed to the screen, and the lexer terminates.
+
+Once the heredoc string has been completely scanned, the `SCAN_STRING` state is activated. Again, there's a number of different input patterns that may be scanned:
+
+1. Another heredoc marker (`<<{Q_STRING}`, [line 428](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#428)). See Scenario 2 for a discussion of this.
+2. End of line ([line 447](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#447)). Nothing is done.
+3. Any character ([line 449](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L449)). The character (for instance, a parenthesis) is written to the output.
+4. End of file ([line 451](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L451)). End of file, in this context, means end of string. So, we've finished scanning the "rest of line" string buffer, so now the lexer needs to switch back to read the next input from the file again. Also, the lexer's state is switched back to the default state (`INITIAL`).
+
+This completes the processing of a single heredoc string.
+
+**Scenario 1b: single heredoc argument parsing**
+
+Scenario 1b is almost the same as Scenario 1a, except that instead of a heredoc string being assigned to some target (register), the heredoc string is an argument to a function. Consider the following input:
+
+	.sub main
+	  foo(<<'EOS')
+	This
+	is
+	a
+	heredoc
+	string.
+	
+	EOS
+	.end
+
+The process of parsing this heredoc string is pretty much the same as in Scenario 1a, except that the "rest of the line" contains the closing parenthesis ")" to close the argument list of the invocation of `foo`.
+
+**Scenario 2: multiple heredoc parsing**
+
+Consider the following input:
+
+	.sub main
+	   foo(<<'A', 42, <<'B', <<C')
+	heredoc text a
+	A
+	heredoc text b
+	B
+	heredoc text c
+	C
+	
+	.end
+
+Now, scanning up to and including the first heredoc marker:
+
+	foo(<<'A'
+
+is done exactly the same as described in Scenario 1. Assume that the lexer just found the heredoc delimiter for heredoc string A. The lexer's current state is `HEREDOC_STRING`, but as can be seen in [line 404](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L404), the lexer will now switch to `SCAN_STRING` state in order to scan the "rest of the line". The rest of the line buffer contains:
+
+	, 42, <<'B', <<'C')
+
+First the comma and whitespace is scanned, handled by [line 449](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L449). Then the argument "42" is matched ([line 449](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L449), "any character") as well as the comma.
+
+Then the heredoc marker for heredoc B is scanned ([line 428](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L428)). This section of code is almost similar to the section that matches heredoc markers in the `INITIAL` state ([line 306](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L306)). The difference is that instead of activating `SAVE_REST_OF_LINE` state, the `SAVE_REST_AGAIN` state is activated. `SAVE_REST_AGAIN` is almost the same to `SAVE_REST_OF_LINE` state. The difference is, that in `SAVE_REST_OF_LINE`, the lexer is still reading from the file buffer, whereas when the lexer is in `SAVE_REST_AGAIN`, it is scanning a string buffer. Therefore, the lexer must switch from the string buffer to reading the file buffer, which is done in [line 350](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L350).
+
+At this point, heredoc string B is scanned. After that, heredoc string C is scanned. It is left as the proverbial exercise to the reader to try to understand how this is done. The previous discussion of the involved lexer states should greatly help in this.
+
+**POD parsing**
+
+POD comments are filtered out from the input. This is implemented in [lines 287 to 301](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L287)). Note that [line 287](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L287) is very important: it matches a "=cut" directive (which ends a POD comment) in the `INITIAL` state (so, when no previous POD comment was seen yet). If this pattern wouldn't be matched in the `INITIAL` state, the "=cut" directive would actually activate the POD state. This is because "=cut" starts with a "=", which is the first character of a POD directive (see [line 289](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L289)).
+
+**include directives**
+
+The `.include` directive is logically a macro expansion directive. It takes one argument, which is the name of a file. If the `.include` directive is encountered, the lexer switches to the specified file, and starts reading from that file. Once the end of the file has been reached, the lexer switches back to the original file.
+
+The `.include` directive is implemented in the heredoc preprocessor. This is necessary in order to be able to use heredoc strings in the included file. If the directive would have been implemented in the normal PIR lexer (that implements macro expansion), then the heredoc preprocessor would have to be invoked first on the included file.
+
+Once the `.include` directive is read, the lexer switches state from `INITIAL` to `INCLUDE` ([line 479](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L479)). This is done using the built-in state stack in the Flex-generated lexer. The `INCLUDE` state is pushed onto the state stack, and immediately activated. (Once the state is popped off, the lexer switches to the state that's then the new top-of-stack. Since an included file can include other files, a stack is used to keep track of this. Four different input patterns are distinguished:
+
+1. whitespace ([line 483](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L483)). Whitespace is skipped.
+2. a quoted string, which is the name of the file to be included ([line 485](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L485)). Once the quoted string is stripped from its quotes, the file is located and the lexer will start processing that file.
+3. end of line [(line 528](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L528)). This would be the end-of-line after the quoted string that was included. Once this is encountered, the included file has already been completely processed. Therefore, the lexer's state is popped off the lexer state stack.
+4. any other character ([line 532](https://github.com/parrot/pirc/blob/master/src/hdocprep.l#L532)), resulting in an error message.
+
+Macro layer
+-----------
+
+The macro layer is implemented in both the lexer and the scanner. The syntax to define and expand macros is defined in the parser. This is a fundamental difference from how macros are implemented in IMCC. In IMCC, the macro layer is completely implemented in the lexer.
+
+Currently, basic macros work, but nested macros do not. This needs to be fixed.
+
+PIRC Parser
+-----------
+
+The parser is implemented in [/src/pir.y](https://github.com/parrot/pirc/blob/master/src/pir.y). This is a parser specification that needs to be processed by the Bison program in order to generate the C file.
+
+Symbol Management
+-----------------
+
+Symbol management is implemented in [/src/pirsymbol.c](https://github.com/parrot/pirc/blob/master/src/pirsymbol.c). Symbols declared using the `.local` directive are stored in a symbol table. Whenever an identifier is parsed, it will be looked up in this symbol table.
+
+All uses of PIR registers (e.g. `$I42`) are registered as well. The first time a PIR register is used, it is assigned a PASM register. This process is called "coloring". The word "color" is often used in the context of register allocation, since the "classic" algorithm to do so is called "graph-coloring". While the vanilla register allocator does not such algorithm, the field "color" is used for storing the actual PASM register number that was assigned.
+
+Constant Folding
+----------------
+
+Strength Reduction
+------------------
+
+Abstract Syntax Tree
+--------------------
+
+During the parsing phase, an Abstract Syntax Tree (AST) is constructed. There are a number of different node types. There were two approaches for defining the node types:
+
+1. Define one node type, that contains all fields that could be needed. An advantage of this approach would be that it simplifies the code. On the other hand, it would probably make the code more obscure to read (since you can't really see what a node represents anymore), and also it would waste memory, since many fields would not be used by most of the instances. Furthermore, it would be easier to misuse certain fields for other purposes than the field was supposed to be used for.
+2. Define specialized types. This is the approach taken.
+
+PIRC defines the following node types in [/src/pircompunit.h](https://github.com/parrot/pirc/blob/master/src/pircompunit.h):
+
+* [constdecl](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L162), used for a .const or `.globalconst` declaration
+* [constant](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L172), used to represent literal constants in the source code (e.g. 42, 3.14, "hello")
+* [label](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L180), used to store a label and its instruction offset
+* [expression](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L196), used to represent an instruction operand. Since there are many different AST node types, and an instruction can have various types of operands, the expression node type is used to wrap these.
+* [key_entry](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L216), used to represent a key value; for instance the key [1;"hi"] has 2 entries: 1 and "hi".
+* [key](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L225), used to represent a key; it has a pointer to the first key value, and keeps track of the total number of key entries ([1;"hi"] has 2 key entries)
+* [target](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L238), used to represent a left-hand side (LHS) object. As such, it can be assigned a value (hence the name target), and it can be used as a right-hand side (RHS) value.
+* [argument](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L255), used to represent argument values for subroutine invocations, or for return statements. It has a pointer to an expression node that is the actual value, an `flags` field that encodes any flags (such as `:flat`, and an `alias` field, if the argument is passed by name.
+* [invocation](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L275), used to temporarily represent a subroutine invocation or a return statement. It is used only temporarily; `invocation` nodes are not stored in the AST. Instead, they are converted into a set of instructions after the subroutine invocation or return statement has been parsed.
+* [instruction](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L288), used to represent a single instruction.
+* [subroutine](https://github.com/parrot/pirc/blob/master/src/pircompunit.h#L354), used to represent a subroutine definition.
+
+Vanilla Register Allocator
+--------------------------
+
+PIRC has a built-in vanilla register allocator. The vanilla register allocator (or "register allocator" as we shall call it from now) maps PIR registers, such as `$P44`, `$I9999`, etc., to actual Parrot registers (or "PASM registers" as they are also referred to). Parrot allocates a variable number of registers per sub invocation. Some simple subs only need a few registers, whereas complex subroutines may need several tens of registers.
+
+Now, how does this work? PIR registers should be considered as "pre-declared" symbols; they are just symbols that you can use without declaring them. If you want fancy names, you would use the `.local` directive to declare them, after which you can use symbolic names (which are more descriptive than PIR registers).
+
+Basically, PIR registers and declared symbols are the same. The register allocator is reset for each subroutine. Whenever a new register is needed, it will start at 0, and increment a counter. PIR registers will always be allocated a PASM register, whereas declared symbols will only be assigned a PASM register if the symbol is actually used. This is because you could declare a bunch of `.local` symbols, but never use them. Allocating registers to them would be wasteful.
+
+Register Usage Optimizer
+------------------------
+
+The vanilla register allocator is pretty dumb, in the sense that it does not consider the lifetime of variables. Or, put in another way, it assumes that all registers' lifetime is the complete subroutine. However, in real life, a register is typically only used in a small part of the subroutine. Consider this example:
+
+	.sub main
+	
+	  .local int a, b, c
+	  a = 1
+	  b = 2
+	  c = 3
+	
+	.end
+
+The vanilla register will allocate registers 0 to 2 to these symbols `a`, `b` and `c`. However, as you can guess, since `a` is never used after the initial assignment, there is no need to assign a different register to `b`. Likewise for `b`, which can share the same register with `c`. So, in the above example, there is really only one register needed.
+
+However, suppose we change the example into the following:
+
+	.sub main
+	
+	  .local int a, b, c
+	  a = 1
+	  b = 2
+	  c = 3
+	  print a
+	  print b
+	
+	.end
+
+In this case, the lifetime of `a` and `b` are extended, as both variables are used in the `print` statements. So, `a` cannot share a register with `b` nor with `c`. The rest of this subsection explains how this can be calculated.
+
+The register optimizer is a variant of the Linear Scan Register allocation algorithm as described in [this paper](http://www.google.ie/url?sa=t&source=web&ct=res&cd=1&url=http%3A%2F%2Fwww.cs.ucla.edu%2F~palsberg%2Fcourse%2Fcs132%2Flinearscan.pdf&ei=w9F5SvzVDpOqsAa_7tyeBQ&usg=AFQjCNETIxGGy87F9GzLawd4euXEaldcnQ&sig2=Hd7nnjdQrgnOqix-8sx92g). Since that algorithm assumes there's a fixed number of registers (which is the case for hardware processors), the algorithm is changed in a few places.
+
+The implementation can be found in [/src/pirregalloc.c](https://github.com/parrot/pirc/blob/master/src/pirregalloc.c). Whether or not to use the register optimizer depends on how your program is used. If you have a large program that you will run many times, and memory usage is important, then you should activate it. If, on the other hand, runtime performance (compilation time included) is important, you should not activate it, as it takes additional time to perform the register optimization. In order to activate the register optimizer, use the `-r` command line option when running PIRC.
+
+For each symbol (PIR register or declared symbol), a [live_interval](https://github.com/parrot/pirc/blob/master/src/pirregalloc.h#L29) struct instance is allocated. Most important are the `startpoint` and `endpoint` fields, which keep track of the start and end point respectively of the live interval of the variable. Consider the following example:
+
+	  .sub main
+	0   $I10 = 1
+	1   $I11 = 2
+	2   print $I0
+	3   print $I1
+	  .end
+
+In this code snippet, the numbers in front of the statements indicate the sequence of instructions. As you can see, `$I0` lives from 0 to 2, whereas `$I1` lives from 1 to 3. Since these live intervals are overlapping, this means that these variables cannot share a register. On the other hand, consider the following example:
+
+	   .sub main
+	0    $I0 = 1
+	1    print $I0
+	2    $I1 = 2
+	3    print $I1
+	   .end
+
+In this case, `$I0` lives from 0 to 1, whereas `$1` lives from 2 to 3. Since they do not overlap, these variables can share a register. This can be calculated by the algorithm described in the above mentioned paper. These details will not be discussed here; instead the reader is referred to the paper.
+
+Now you know the basic working and purpose of the register optimizer, let's look at the implementation. Following the design principle of PIRC to be as modular as possible, the register optimizer's state is stored in a struct. A new [`lsr_allocator`](https://github.com/parrot/pirc/blob/master/src/pirregalloc.h#L66) object (lsr stands for Linear Scan Register) can be created in the function [`new_linear_scan_register_allocator`](https://github.com/parrot/pirc/blob/master/src/pirregalloc.h#L85). This constructor takes a pointer to the PIRC compiler struct instance. Yes, this does mean it is somewhat dependent on this other object, but it made the implementation somewhat easier. The struct keeps a list of all "active" live intervals (one for each variable that's alive).
+
+Bytecode Generation
+-------------------
+
+Running code at compile time: the :immediate flag
+-------------------------------------------------

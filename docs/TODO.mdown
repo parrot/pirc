@@ -1,0 +1,16 @@
+PIRC Development Tasks
+======================
+
+Shouldn't-be-too-hard tasks
+---------------------------
+
+* write tests for the generated output.
+
+Hardcore hacking tasks
+----------------------
+
+* Fix parser to "calculate" the right signature for ops such as: `$P0 = new ['Integer']`
+
+Currently, the argument is encoded as `_ksc`, for key, string-constant.
+
+* Convert all C strings in PIRC into `STRINGs`. All identifiers and strings that are scanned should be stored as `STRING` objects, not C strings.

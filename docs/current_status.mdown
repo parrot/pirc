@@ -1,0 +1,4 @@
+PIRC Status
+===========
+
+PIRC is not complete yet. All stages are implemented (lexer, parser, bytecode generator), but all of them need some additional work to complete them. See the section below for the specific items that need to be fixed. Once these are fixed, PIRC will be done about 98%.
