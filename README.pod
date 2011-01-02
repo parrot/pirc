@@ -1,8 +1,8 @@
-# Copyright (C) 2001-2009, Parrot Foundation.
+# Copyright (C) 2001-2010, Parrot Foundation.
 
 =head1 NAME
 
-README.txt - Readme file for PIRC compiler.
+README.pod - Readme file for the PIRC compiler.
 
 =head1 DESCRIPTION
 
@@ -17,11 +17,11 @@ Its main features are:
 
 =item * constant folding, implemented in the parser.
 
-=item * checks for proper use of op arguments in PIR syntax (disallowing, e.g.: $S0 = print)
+=item * checking for proper use of op arguments in PIR syntax (disallowing, e.g.: $S0 = print)
 
-=item * allow multiple heredocs in subroutine invocations (like: foo(<<'A', <<'B', <<'C') )
+=item * allowing multiple heredocs in subroutine invocations (like: foo(<<'A', <<'B', <<'C') )
 
-=item * register usage optimization
+=item * providing register usage optimization
 
 =back
 
@@ -33,8 +33,8 @@ To compile PIRC on windows using MSVC:
 
    nmake
 
-When running PIRC, it needs the shared library C<libparrot>; an easy way to do
-this is copy C<libparrot.dll> in the Parrot root directory to C<compilers/pirc/src>.
+Running PIRC requires the shared library C<libparrot>; an easy way to do
+this is to copy C<libparrot.dll> in the Parrot root directory to C<compilers/pirc/src>.
 
 Running PIRC is as easy as:
 
@@ -48,8 +48,8 @@ The Makefile should work fine on Linux:
 
  cd compilers/pirc && make
 
-When running PIRC, it needs the shared library C<libparrot>; in order to let
-PIRC find it, set the path as follows:
+PIRC needs the shared library C<libparrot>; in order to let PIRC find it,
+set the path as follows:
 
  export LD_LIBRARY_PATH=../../../blib/lib
 
@@ -72,7 +72,7 @@ as a two-stage compiler:
 
 =head2 Heredoc preprocessing
 
-The heredoc preprocessor takes the input as written by the PIR programmer,
+The heredoc preprocessor takes the input as written by the PIR programmer
 and flattens out all heredoc strings. An example is shown below to illustrate
 this concept:
 
@@ -94,7 +94,7 @@ is transformed into:
    $S0 = "This is a heredoc string\n  divided\n    over\n      five\n        lines.\n"
  .end
 
-In order to allow C<.include>d file to have heredoc strings, the heredoc preprocessor
+In order to allow an C<.include>d file to have heredoc strings, the heredoc preprocessor
 also handles the C<.include> directive, even though logically this is a macro function.
 See the discussion below for how the C<.include> directive works.
 
@@ -204,7 +204,7 @@ types of the operands. For instance:
 
  set $I0, 42
 
-will select the C<set_i_ic> instruction: this is the C<set> instruction, taking
+will select the C<set_i_ic> instruction: the C<set> instruction, taking
 an integer (i) result operand and an integer constant (ic) operand. Other examples
 are:
 
@@ -234,15 +234,17 @@ instance, consider the following statement:
 
 It is clear during compile time, that 1 is smaller than 2; so instead of
 evaluating this during runtime, we know for sure that the branch to label
-C<L1> will be made, effectively replacing the above statement by:
+C<L1> will be made, effectively replacing the above statement with:
 
  goto L1
 
 Likewise, if it's clear that certain instructions don't have any effect,
 they can be removed altogether:
 
- if 1 > 2 goto L1        --> nop  # nop is no opcode.
- $I0 = $I0 + 0           --> nop
+ if 1 > 2 goto L1        --> noop  # noop is no opcode.
+ $I0 = $I0 + 0           --> noop
+
+=head3 Instruction Optimization
 
 Another type of optimization is the selection of (slightly) more efficient
 variants of instructions. For instance, consider the following instruction:
@@ -253,14 +255,9 @@ which is actually syntactic sugar for:
 
  add $I0, $I0, $I1
 
-In C one would write (ignoring the fact that $I0 and $I0 are not a valid C
-identifiers):
-
- $I0 += $I1
-
-which is in fact valid PIR as well. When the PIR parser sees an instruction
-of this form, it will automatically select the variant with 2 operands
-instead of the 3-operand variant. So:
+The C<+=> operator present in many C-style languages can simpify this expression,
+and can also be used in PIR to the same effect. PIRC will simplify
+this for you. So:
 
  add $I0, $I0, $1    # $I0 is an out operand
 
@@ -277,10 +274,9 @@ or, in Parrot assembly syntax:
 
  add $I0, $I0, 1
 
-Again, in C one would write (again ignoring the valid identifier issue): C<$I0++>,
-or in other words, C<incrementing> the given identifier. Parrot has C<inc> and C<dec>
-instructions built-in as well, so that the above statement C<$I0 = $I0 + 1> can be
-optimized to:
+The C-like convention here is the C<incrementation> operator, or <$I0++>. Parrot has
+C<inc> and C<dec> instructions built-in as well, so that the above statement
+C<$I0 = $I0 + 1> can be optimized to:
 
  inc $I0
 
@@ -315,7 +311,7 @@ are reported in trac.parrot.org.
 
 =head1 IMPLEMENTATION
 
-The directory compilers/pirc has a number of subdirectories:
+The PIRC compiler source tree has a number of subdirectories:
 
 =over 4
 
@@ -368,8 +364,8 @@ The parser is implemented in C<pir.y>, and can be regenerated using:
 =head2 Cygwin processable lexer spec.
 
 The file C<pir.l> from which the lexer is generated is I<not> processable by Cygwin's
-default version of Flex. In order to make a reentrant lexer, a newer version is needed,
-which can be downloaded from the link below.
+default version of Flex as of January 2011. In order to make a reentrant lexer,
+a newer version is needed, which can be downloaded from the link below.
 
 L<http://sourceforge.net/project/downloading.php?groupname=flex&filename=flex-2.5.33.tar.gz&use_mirror=belnet>
 
@@ -394,13 +390,13 @@ See also:
 
 =item * C<languages/PIR> for a PGE based implementation.
 
-=item * C<compilers/imcc>, the current I<standard> PIR implementation.
+=item * C<compilers/imcc> in the Parrot source tree, the current I<standard> PIR implementation.
 
-=item * C<docs/imcc/syntax.pod> for a description of PIR syntax.
+=item * C<docs/imcc/syntax.pod> in the Parrot source tree for a description of PIR syntax.
 
-=item * C<docs/imcc/> for more documentation about the PIR language.
+=item * C<docs/imcc/> in the Parrot source tree for more documentation about the PIR language.
 
-=item * C<docs/pdds/pdd19_pir.pod> for the PIR design document.
+=item * C<docs/pdds/pdd19_pir.pod> in the Parrot source tree for the PIR design document.
 
 =back
 
